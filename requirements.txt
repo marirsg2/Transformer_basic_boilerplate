@@ -1,4 +1,4 @@
-torch
-torchtext
-requests
-numpy
+datasets==2.17.0
+Requests==2.31.0
+torch==2.2.0
+torchtext==0.16.2
