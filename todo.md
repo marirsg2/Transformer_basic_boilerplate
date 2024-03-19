@@ -1,2 +1,2 @@
-
-SEE code in scratch.py. It requires a flattened list, whereas
+Seems to be working, ensure it is using the gpu
+THEN do on multi GPU on AWS.

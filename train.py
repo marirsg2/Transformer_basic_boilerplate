@@ -1,120 +1,168 @@
-from config import *
-from datasets import load_dataset
-from positional_encoding import *
+import os
+import math
+import torch
+import torch.nn as nn
+import pytorch_lightning as pl
 from transformer_model import *
-from support_functions import *
+from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import TensorDataset, DataLoader
 #-------------------------
 from torchtext.datasets import WikiText2
 from torchtext.data.utils import get_tokenizer
 from torchtext.vocab import build_vocab_from_iterator
 #---------------------
+from config import *
+from datasets import load_dataset
+from support_functions import *
 
-train_data = load_dataset("wikitext", name="wikitext-2-v1")
-# train_iter = (item for sub_dict in train_data["train"].__iter__() for item in sub_dict['text'])
-train_iter = (sub_dict['text'] for sub_dict in train_data["train"].__iter__() if len(sub_dict['text']) > 0)
-tokenizer = get_tokenizer('basic_english')
-vocab = build_vocab_from_iterator(map(tokenizer, train_iter), specials=['<unk>'])
-vocab.set_default_index(vocab['<unk>'])
+class WrapperTransformerModel(pl.LightningModule):
+    def __init__(self, ntokens, d_model, nhead, d_hid, nlayers, dropout):
+        super(WrapperTransformerModel, self).__init__()
+        self.ntokens = ntokens
+        self.model_type = 'Transformer'
+        self.pos_encoder = PositionalEncoding(d_model, dropout)
+        encoder_layers = TransformerEncoderLayer(d_model, nhead, d_hid, dropout)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        self.embedding = nn.Embedding(ntokens, d_model)
+        self.d_model = d_model
+        self.linear = nn.Linear(d_model, ntokens)
+        self.init_weights()
 
-# ``train_iter`` was "consumed" by the process of building the vocab,
-# so we have to create it again
-train_iter = (sub_dict['text'] for sub_dict in train_data["train"].__iter__() if len(sub_dict['text']) > 0)
-val_iter = (sub_dict['text'] for sub_dict in train_data["validation"].__iter__() if len(sub_dict['text']) > 0)
-test_iter = (sub_dict['text'] for sub_dict in train_data["test"].__iter__() if len(sub_dict['text']) > 0)
-train_data = data_process(train_iter,vocab,tokenizer) # the train data is a list of strings. Each string is a doc/para. see function for details
-val_data = data_process(val_iter,vocab,tokenizer)
-test_data = data_process(test_iter,vocab,tokenizer)
+    def init_weights(self) -> None:
+        initrange = 0.1
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.linear.bias.data.zero_()
+        self.linear.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, src: torch.Tensor, src_mask: torch.Tensor = None) -> torch.Tensor:
+        src = self.embedding(src) * math.sqrt(self.d_model)
+        src = self.pos_encoder(src)
+        if src_mask is None:
+            src_mask = nn.Transformer.generate_square_subsequent_mask(len(src)).to(device)
+            src_mask = nn.Transformer.generate_square_subsequent_mask(len(src)).to(src.device)
+        output = self.transformer_encoder(src, src_mask)
+        output = self.linear(output)
+        return output
+
+    def training_step(self, batch, batch_idx):
+        src, tgt = batch #these are now given in a seq_len (train param) x Batch size
+        src,tgt = src.permute(1,0),tgt.permute(1,0)
+        output = self(src)
+        output_flat = output.view(-1, self.ntokens) # this and tgt.view(-1) helps cross entropy compare the token distrib (After softmax) to the target token
+        loss = F.cross_entropy(output_flat, tgt.reshape(-1))
+        self.log('train_loss', loss)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        src, tgt = batch
+        src,tgt = src.permute(1,0),tgt.permute(1,0)
+        # src.reshape((-1,eval_batch_size))
+        output = self(src)
+        output_flat = output.view(-1, self.ntokens)
+        loss = F.cross_entropy(output_flat, tgt.reshape(-1))
+        # loss = F.cross_entropy(output.view(-1, output.size(-1)), tgt.view(-1))
+        self.log('val_loss', loss)
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        src, tgt = batch
+        src,tgt = src.permute(1,0),tgt.permute(1,0)
+        output = self(src)
+        output_flat = output.view(-1, self.ntokens)
+        loss = F.cross_entropy(output_flat, tgt.reshape(-1))
+        self.log('test_loss', loss)
+        return loss
+
+    def configure_optimizers(self):
+        return Adam(self.parameters(), lr=1e-4)
+        
+
+    # def configure_optimizers(self):
+    #     optimizer = torch.optim.SGD(self.parameters(), lr=self.lr)
+    #     scheduler = StepLR(optimizer, 1.0, gamma=0.95)
+    #     return [optimizer], [scheduler]
 
 
-train_data = batchify(train_data, batch_size,device)  # shape ``[seq_len, batch_size]``
-val_data = batchify(val_data, eval_batch_size,device)
-test_data = batchify(test_data, eval_batch_size,device)
-ntokens = len(vocab)  # size of vocabulary
-model = TransformerModel(ntokens, emsize, nhead, d_hid, nlayers, dropout).to(device)
+class WikiTextDataModule(pl.LightningDataModule):
+    def __init__(self, batch_size, eval_batch_size):
+        super().__init__()
+        self.batch_size = batch_size
+        self.eval_batch_size = eval_batch_size
+        self.tokenizer = get_tokenizer('basic_english')
+
+    def prepare_data(self):
+        self.train_data = load_dataset("wikitext", name="wikitext-2-v1")
+        self.train_iter = (sub_dict['text'] for sub_dict in self.train_data["train"].__iter__() if len(sub_dict['text']) > 0)
+        self.vocab = build_vocab_from_iterator(map(self.tokenizer, self.train_iter), specials=['<unk>'])
+        self.vocab.set_default_index(self.vocab['<unk>'])
+
+    def setup(self, stage=None):
+        if stage == 'fit' or stage is None:
+            self.train_iter = (sub_dict['text'] for sub_dict in self.train_data["train"].__iter__() if len(sub_dict['text']) > 0)
+            val_iter = (sub_dict['text'] for sub_dict in self.train_data["validation"].__iter__() if len(sub_dict['text']) > 0)
+            self.train_data = data_process(self.train_iter, self.vocab, self.tokenizer)
+            self.val_data = data_process(val_iter, self.vocab, self.tokenizer)
+
+    def train_dataloader(self):
+        data_raw_batches = batchify(self.train_data,self.batch_size,device)
+        data_src_target_list = []
+        for batch, i in enumerate(range(0, data_raw_batches.size(0) - 1, bptt)): 
+            #the batch above is just the batch_index, it is really bad naming. i is really the text_data_index
+            #each unit of train_Data is a long sequence length) X batch size; note NOT CONTEXT LENGTH, just length to divide data into batch_size units
+            # i is iterating over the context length.
+            # each get_batch returns the src and target as offset by 1 over the long length, BUT limited to seq_length of 35 (Training param)
+            # since the train_data is in length X batch_size, each offset will also be in batch size. The length will be limited to max 35
+            data_batch, targets_batch = get_batch(data_raw_batches, i) #the code from pytorch puts it in batches, rather than let dataloader do it
+            targets_batch = targets_batch.reshape((-1,self.batch_size))
+             #rather than let dataloader do it. note the targets are single values. For each sequence, one target token
+            flattened_list_pairs = [(data_batch[:,x],targets_batch[:,x]) for x in range(data_batch.shape[1]) if data_batch[:,x].shape[0] == bptt]
+            data_src_target_list += flattened_list_pairs
+        return DataLoader(data_src_target_list, batch_size=self.batch_size, shuffle=True) #num_workers=3
+
+    def val_dataloader(self):
+        data_raw_batches = batchify(self.val_data,self.eval_batch_size,device)
+        data_src_target_list = []
+        for batch, i in enumerate(range(0, data_raw_batches.size(0) - 1, bptt)): 
+            #the batch above is just the batch_index, it is really bad naming. i is really the text_data_index
+            #each unit of train_Data is a long sequence length) X batch size; note NOT CONTEXT LENGTH, just length to divide data into batch_size units
+            # i is iterating over the context length.
+            # each get_batch returns the src and target as offset by 1 over the long length, BUT limited to seq_length of 35 (Training param)
+            # since the train_data is in length X batch_size, each offset will also be in batch size. The length will be limited to max 35
+            data_batch, targets_batch = get_batch(data_raw_batches, i) #the code from pytorch puts it in batches,
+            targets_batch = targets_batch.reshape((-1,self.eval_batch_size))
+             #rather than let dataloader do it. note the targets are single values. For each sequence, one target token
+            flattened_list_pairs = [(data_batch[:,x],targets_batch[:,x]) for x in range(data_batch.shape[1]) if data_batch[:,x].shape[0] == bptt]
+            data_src_target_list += flattened_list_pairs
+        return DataLoader(data_src_target_list, batch_size=self.eval_batch_size, shuffle=True) #num_workers=3
+
+    def test_dataloader(self):
+        test_iter = (sub_dict['text'] for sub_dict in self.train_data["test"].__iter__() if len(sub_dict['text']) > 0)
+        test_data = data_process(test_iter, self.vocab, self.tokenizer)
+        data_raw_batches = batchify(test_data,self.eval_batch_size,device)
+        data_src_target_list = []
+        for batch, i in enumerate(range(0, data_raw_batches.size(0) - 1, bptt)): 
+            #the batch above is just the batch_index, it is really bad naming. i is really the text_data_index
+            #each unit of train_Data is a long sequence length) X batch size; note NOT CONTEXT LENGTH, just length to divide data into batch_size units
+            # i is iterating over the context length.
+            # each get_batch returns the src and target as offset by 1 over the long length, BUT limited to seq_length of 35 (Training param)
+            # since the train_data is in length X batch_size, each offset will also be in batch size. The length will be limited to max 35
+            data_batch, targets_batch = get_batch(data_raw_batches, i) #the code from pytorch puts it in batches, rather than let dataloader do it
+            targets_batch = targets_batch.reshape((-1,self.eval_batch_size))
+             #rather than let dataloader do it. note the targets are single values. For each sequence, one target token
+            flattened_list_pairs = [(data_batch[:,x],targets_batch[:,x]) for x in range(data_batch.shape[1]) if data_batch[:,x].shape[0] == bptt]
+            data_src_target_list += flattened_list_pairs
+        return DataLoader(data_src_target_list, batch_size=self.eval_batch_size, shuffle=True) #num_workers=3
+
+batch_size = 20
+eval_batch_size = 10
+bptt = 35
+lr = 5.0
 
 
-#====================================================================================
-import time
+data_module = WikiTextDataModule(batch_size, eval_batch_size)
+data_module.prepare_data()
+model = WrapperTransformerModel(len(data_module.vocab), emsize, nhead, d_hid, nlayers, dropout)
 
-criterion = nn.CrossEntropyLoss()
-lr = 5.0  # learning rate
-optimizer = torch.optim.SGD(model.parameters(), lr=lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1.0, gamma=0.95)
-
-def train(model: nn.Module) -> None:
-    model.train()  # turn on train mode
-    total_loss = 0.
-    log_interval = 200
-    start_time = time.time()
-
-    num_batches = len(train_data) // bptt
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, bptt)):
-        data, targets = get_batch(train_data, i)
-        output = model(data)
-        output_flat = output.view(-1, ntokens)
-        loss = criterion(output_flat, targets)
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        optimizer.step()
-
-        total_loss += loss.item()
-        if batch % log_interval == 0 and batch > 0:
-            lr = scheduler.get_last_lr()[0]
-            ms_per_batch = (time.time() - start_time) * 1000 / log_interval
-            cur_loss = total_loss / log_interval
-            ppl = math.exp(cur_loss)
-            print(f'| epoch {epoch:3d} | {batch:5d}/{num_batches:5d} batches | '
-                  f'lr {lr:02.2f} | ms/batch {ms_per_batch:5.2f} | '
-                  f'loss {cur_loss:5.2f} | ppl {ppl:8.2f}')
-            total_loss = 0
-            start_time = time.time()
-
-def evaluate(model: nn.Module, eval_data: Tensor) -> float:
-    model.eval()  # turn on evaluation mode
-    total_loss = 0.
-    with torch.no_grad():
-        for i in range(0, eval_data.size(0) - 1, bptt):
-            data, targets = get_batch(eval_data, i)
-            seq_len = data.size(0)
-            output = model(data)
-            output_flat = output.view(-1, ntokens)
-            total_loss += seq_len * criterion(output_flat, targets).item()
-    return total_loss / (len(eval_data) - 1)
-
-#====================================================================
-
-best_val_loss = float('inf')
-epochs = 3
-
-with TemporaryDirectory() as tempdir:
-    best_model_params_path = os.path.join(tempdir, "best_model_params.pt")
-
-    for epoch in range(1, epochs + 1):
-        epoch_start_time = time.time()
-        train(model)
-        val_loss = evaluate(model, val_data)
-        val_ppl = math.exp(val_loss)
-        elapsed = time.time() - epoch_start_time
-        print('-' * 89)
-        print(f'| end of epoch {epoch:3d} | time: {elapsed:5.2f}s | '
-            f'valid loss {val_loss:5.2f} | valid ppl {val_ppl:8.2f}')
-        print('-' * 89)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_params_path)
-
-        scheduler.step()
-    model.load_state_dict(torch.load(best_model_params_path)) # load best model states
-
-#===================================================================
-
-test_loss = evaluate(model, test_data)
-test_ppl = math.exp(test_loss)
-print('=' * 89)
-print(f'| End of training | test loss {test_loss:5.2f} | '
-      f'test ppl {test_ppl:8.2f}')
-print('=' * 89)
-
+data_module = WikiTextDataModule(batch_size, eval_batch_size)
+trainer = pl.Trainer(max_epochs=3)
+trainer.fit(model, data_module)

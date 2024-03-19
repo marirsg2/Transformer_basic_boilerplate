@@ -2,8 +2,10 @@ import torch
 from torch import nn, Tensor
 import math
 from config import *
+import pytorch_lightning as pl
 
-class PositionalEncoding(nn.Module):
+
+class PositionalEncoding(pl.LightningModule):
 
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
@@ -23,3 +25,4 @@ class PositionalEncoding(nn.Module):
         """
         x = x + self.pe[:x.size(0)]
         return self.dropout(x)
+    
