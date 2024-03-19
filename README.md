@@ -1,4 +1,4 @@
-=================
+
 Has two versions, vanilla torch, and pytorch lightning version (see lightning branch)
 
 # To run
