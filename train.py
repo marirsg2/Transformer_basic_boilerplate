@@ -89,6 +89,7 @@ class WikiTextDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.eval_batch_size = eval_batch_size
         self.tokenizer = get_tokenizer('basic_english')
+        self.prepare_data()
 
     def prepare_data(self):
         self.train_data = load_dataset("wikitext", name="wikitext-2-v1")
@@ -160,9 +161,6 @@ lr = 5.0
 
 
 data_module = WikiTextDataModule(batch_size, eval_batch_size)
-data_module.prepare_data()
 model = WrapperTransformerModel(len(data_module.vocab), emsize, nhead, d_hid, nlayers, dropout)
-
-data_module = WikiTextDataModule(batch_size, eval_batch_size)
 trainer = pl.Trainer(max_epochs=3)
 trainer.fit(model, data_module)
