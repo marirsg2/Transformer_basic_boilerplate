@@ -2,7 +2,7 @@
 Has two versions, vanilla torch, and pytorch lightning version (see lightning branch)
 
 # To run
-pip install requirements.txt
+pip install -r requirements.txt
 
 run the train.py file and make sure it runs.
 
