@@ -4,3 +4,5 @@ __pycache__/support_functions.cpython-311.pyc
 __pycache__/*
 *.yaml
 lightning_logs/*
+transformers/*
+*.pyc
